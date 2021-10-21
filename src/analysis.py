@@ -68,7 +68,7 @@ def select_sample(samples, p, serialize=False):
 def trim_and_select_sample(samples, p, serialize=False):
   return trim_sample(select_sample(samples, p, serialize), serialize)# designed so that order doesn't matter
 
-@tf.function
+# @tf.function don't unwind the top-level for loop statically
 def compute_intensities(params, event_types, event_times, batch_size, eval_batch_size, resolution, verbose=False): # resolution is total grid points across entire record
   leftover_excitation = tf.zeros_like(params.excitation_coef)
   leftover_suppression = tf.zeros_like(params.excitation_coef) # this is of the correctly expanded size

@@ -31,10 +31,10 @@ def chop_record_by_time_interval(event_types, event_times, interval): # can we d
   n_partitions = partitions[-1] + 1
   interval_event_types = tf.ragged.stack_dynamic_partitions(event_types, partitions, n_partitions) # n_intervals x events
   interval_event_times = tf.ragged.stack_dynamic_partitions(event_times, partitions, n_partitions)
-  return interval_event_types, interval_event_times, n_partitions
+  return interval_event_types[:-1, :], interval_event_times[:-1, :], n_partitions-1 # throw away the last interval, which may have a smaller size (might rely on fixed windows in our metrics down the line)
 
-@tf.function #                         <history record---------------------><forecast---------------------->
-def forecast_window_aggregates(params, event_types, event_times, batch_size, window, n_events, n_simulations,
+@tf.function #                         <history record---------------------><forecast----------------------------------->
+def forecast_window_aggregates(params, event_types, event_times, batch_size, window, n_events, n_simulations, sub_windows,
     warm_start_excitation=None, warm_start_suppression=None, time_of_warm_start=None, return_leftovers=False): # could be multiple processes, over which we will take an expectation. window is in real time units. hope that n_events generally is enough to exceed the window interval
   if warm_start_excitation is None:
     leftover_excitation = tf.zeros_like(params.excitation_coef)
@@ -69,36 +69,48 @@ def forecast_window_aggregates(params, event_types, event_times, batch_size, win
     processes = (an.trim_and_select_sample(params, p, True) for p in range(n_processes))
     process_excitations = (leftover_excitation[p, ...] for p in range(n_processes))
     process_suppressions = (leftover_suppression[p, ...] for p in range(n_processes))
+  n_splits, = sub_windows.shape # one dimension only
   aggregates = []
   max_n_events_counted = 0
   for process, excitation, suppression in zip(processes, process_excitations, process_suppressions):
-    process_aggregate = tf.zeros([params.n_dims], dtype=event_times.dtype)
+    process_aggregates = tf.zeros([params.n_dims, n_splits], dtype=event_times.dtype)
     for sim in tf.range(n_simulations):
       sim_types, sim_times = MultivariateProcess\
         .simulate_events_memoryless(process, n_events, warm_excitations=excitation, warm_suppressions=suppression)
       window_filter = sim_times <= window # no need to add forecast_beginning because simulation always starts at 0
       window_types = tf.where(window_filter, sim_types, -tf.ones([], dtype=sim_types.dtype)) # -1 marks events that are thrown away
-      instances = tf.math.equal(window_types, tf.range(params.n_dims, dtype=window_types.dtype)[:, None])
-      aggregate = tf.math.count_nonzero(instances, axis=1, dtype=event_times.dtype)
+      window_assignments = tf.searchsorted(sub_windows, sim_times) # len(sim_times)-vector of integers from [0, n_splits], where the last value means out-of-bounds
+      instances = tf.math.equal(window_types, tf.range(params.n_dims, dtype=window_types.dtype)[:, None]) # (n_types x window events)
+      aggregate = tf.math.count_nonzero(instances, axis=1, dtype=event_times.dtype) # this one is not really needed anymore
+      instance_indicators = tf.transpose(tf.cast(instances, tf.int32)) # (window events x n_types)
+      split_aggregates = tf.math.segment_sum( # ASSIGNMENTS NEED TO BE SORTED
+        tf.concat([instance_indicators, tf.broadcast_to([[0]], [1, params.n_dims])], axis=0),
+        tf.concat([window_assignments, [n_splits]], axis=0) ) # (n_splits+1 x n_types). append a "guard" element to ensure consistent sizes
+      # see tf.math.bincount as well (which only accepts non-negative integer arrays), or tf.math.segment_sum that operates on a tensor's first dimension..
       n_events_counted = tf.cast(tf.math.reduce_sum(aggregate, axis=0), tf.int32)
       if n_events_counted > max_n_events_counted: # does this serial dependence hinder parallelization?
         max_n_events_counted = n_events_counted
-      process_aggregate += aggregate
-    aggregates.append(process_aggregate / tf.cast(n_simulations, event_times.dtype))
+      process_aggregates += tf.cast(tf.transpose(split_aggregates[:-1, :]), event_times.dtype)
+      process_aggregates = tf.ensure_shape(process_aggregates, [None, n_splits])
+    aggregates.append(process_aggregates / tf.cast(n_simulations, event_times.dtype))
   aggregates = tf.convert_to_tensor(aggregates)
+  if n_splits == 1:
+    aggregates = aggregates[..., 0]
   if return_leftovers:
     return aggregates, max_n_events_counted, leftover_excitation, leftover_suppression, time_of_leftover
   return aggregates, max_n_events_counted
 
 @tf.function
-def backtest_rolling_forecast_aggregates(params, historic_types, historic_times, event_types, event_times, batch_size, window, n_events, n_simulations, score_against, score_shape=[], pred_window_multiple=1): # our time step is the same as the window size. params may contain multiple processes once again
+def backtest_rolling_forecast_aggregates(params, historic_types, historic_times, event_types, event_times,
+    batch_size, window, n_events, n_simulations, score_against, score_shape=[], pred_window_multiple=1, n_splits=1): # our time step is the same as the window size. params may contain multiple processes once again
   interval_event_types, interval_event_times, n_intervals = chop_record_by_time_interval(event_types, event_times, window)
   leftover_excitation = tf.zeros_like(params.excitation_coef)
   leftover_suppression = tf.zeros_like(params.suppression_coef)
   time_of_leftover = historic_times[0]
   n_evaluations = (n_intervals - 1 if historic_types is None else n_intervals) - pred_window_multiple + 1 # if we are given (historic_types, historic_times), then we may evaluate every single interval by kickstarting on e.g. the training set. Helps especially when the test set is tiny.
-  n_processes = tf.shape(params.excitation_coef)[0] if tf.rank(params.excitation_coef) == 3 else 1
-  scores = tf.zeros([n_evaluations, n_processes] + score_shape, dtype=event_times.dtype)
+  n_processes = params.excitation_coef.shape[0] if len(params.excitation_coef.shape) == 3 else 1 # static version of `tf.rank`
+  scores = tf.zeros([n_evaluations, n_processes] + list(score_shape), dtype=event_times.dtype)
+  anchor_time = tf.cast(0, dtype=event_times.dtype) # should really be set with the first interval, otherwise might produce garbage until changed
   prev_hard_window = tf.cast(window, event_times.dtype)
   for interval in tf.range(n_evaluations): # all completely dynamic. funny that this is a desideratum now that static unrolling has become a bottleneck, contraty to how it is in most programming environments!
     if historic_times is None:
@@ -111,19 +123,34 @@ def backtest_rolling_forecast_aggregates(params, historic_types, historic_times,
     if tf.size(prelude_times) == 0:
       hard_window = prev_hard_window
     else:
-      hard_window = tf.math.minimum(event_times[-1] - prelude_times[-1], window * pred_window_multiple) # if we are at the end of the record, our last interval must be subjected to a hard cutoff. pred_window_multiple allows us to achieve a crude version of overlapping sliding windows: make the intervals small, then forecast over a collection of them.
+      anchor_time = prelude_times[-1] # basically `prelude_times[-1]`, with the added functionality of tracking the last non-empty one
+      # this shouldn't be needed now that the last interval is thrown away anyways. keep it as a failsafe
+      hard_window = tf.math.minimum(event_times[-1] - anchor_time, window * pred_window_multiple) # if we are at the end of the record, our last interval must be subjected to a hard cutoff. pred_window_multiple allows us to achieve a crude version of overlapping sliding windows: make the intervals small, then forecast over a collection of them.
+    sub_windows = tf.linspace(tf.cast(0, event_times.dtype), hard_window, n_splits+1)[1:]
     aggregates, max_n_events_counted, leftover_excitation, leftover_suppression, time_of_leftover = \
-      forecast_window_aggregates(params, prelude_types, prelude_times, batch_size, hard_window, n_events, n_simulations,
-      warm_start_excitation=leftover_excitation, warm_start_suppression=leftover_suppression, time_of_warm_start=time_of_leftover, return_leftovers=True)
+      forecast_window_aggregates(params, prelude_types, prelude_times, batch_size, hard_window, n_events, n_simulations, sub_windows,
+        warm_start_excitation=leftover_excitation, warm_start_suppression=leftover_suppression, time_of_warm_start=time_of_leftover, return_leftovers=True)
     tf.print("Counted at most", max_n_events_counted, "simulated events out of", n_events, "in interval", interval+1, "out of", n_evaluations, "\b.")
     real_deal_intervals = interval_event_types[(interval+1):(interval+1+pred_window_multiple), ...] if historic_times is None \
       else interval_event_types[interval:(interval+pred_window_multiple), ...]
     real_deal_types = tf.concat([real_deal_intervals[i, ...] for i in range(pred_window_multiple)], axis=0) # how is it so hard to unstack and flatten a ragged tensor?
-    real_instances = tf.math.equal(real_deal_types, tf.range(params.n_dims, dtype=real_deal_types.dtype)[:, None])
-    real_aggregate = tf.math.count_nonzero(real_instances, axis=1, dtype=event_times.dtype)
-    interval_scores = score_against(aggregates, real_aggregate) # must return a tensor with one entry (row? hyper-row?) for each process
+    real_deal_time_intervals = interval_event_times[(interval+1):(interval+1+pred_window_multiple), ...] if historic_times is None \
+      else interval_event_times[interval:(interval+pred_window_multiple), ...]
+    real_deal_times = tf.concat([real_deal_time_intervals[i, ...] for i in range(pred_window_multiple)], axis=0)
+    real_instances = tf.math.equal(real_deal_types, tf.range(params.n_dims, dtype=real_deal_types.dtype)[:, None]) # (n_types x window events)
+    if n_splits == 1:
+      real_aggregates = tf.math.count_nonzero(real_instances, axis=1, dtype=event_times.dtype)
+    else:
+      real_instance_indicators = tf.transpose(tf.cast(real_instances, tf.int32)) # (window events x n_types)
+      real_assignments = tf.searchsorted(sub_windows, real_deal_times - anchor_time) # shift the frame of reference
+      split_real_aggregates = tf.math.segment_sum( # see `forecast_window_aggregates` for explanation
+        tf.concat([real_instance_indicators, tf.broadcast_to([[0]], [1, params.n_dims])], axis=0),
+        tf.concat([real_assignments, [n_splits]], axis=0) ) # (n_splits+1 x n_types)
+      real_aggregates = tf.cast(tf.transpose(split_real_aggregates[:-1, :]), event_times.dtype) # touched-up/refined version of the above
+    interval_scores = score_against(aggregates, real_aggregates)# real_aggregate if n_splits==1 else real_aggregates -- for some reason this is not treated purely like a static evaluation.. must be something with the decorator
+    # ^ must return a tensor with one entry (row? hyper-row?) for each process
     selector = tf.reshape(tf.one_hot(interval, n_evaluations, dtype=scores.dtype), [-1, 1] + [1]*len(score_shape))
-    scores += interval_scores * selector
+    scores += tf.ensure_shape(interval_scores, [n_processes] + score_shape) * selector
     prev_hard_window = hard_window
   return scores
 
@@ -183,5 +210,61 @@ def score_reciprocal_rank(real_cutoff_ranks): # 1/rank, where rank starts at 1, 
     return tf.transpose(reciprocal_rank) # n_processes x n_scores
   return eval, [n_scores]
 
+def score_rank_biased_overlap(discounts):
+  n_scores = len(discounts)
+  def eval(aggregates, real_aggregate):
+    nonlocal discounts # `global` probably would not do precisely what's intended here
+    discounts = tf.cast(discounts, aggregates.dtype)
+    n_processes, n_types = aggregates.shape[0], tf.shape(aggregates)[1]
+    prediction_indices = tf.argsort(aggregates, axis=1, direction="DESCENDING")
+    actual_indices = tf.argsort(real_aggregate, direction="DESCENDING")
+    total_scores = tf.zeros([n_processes, n_scores], dtype=aggregates.dtype)
+    for size in tf.range(1, n_types+1): # dynamical slicing
+      prediction_set = prediction_indices[:, :size]
+      actual_set = tf.broadcast_to(actual_indices[:size], tf.shape(prediction_set))
+      # did I really find a more chill way that gets away without invoking `get_top_event_types` ? I think the accumulated complexity is a holdover from attempting to use quantiles in place of ranks
+      intersection = tf.sets.intersection(prediction_set, actual_set) # returns a sparse tensor with non-null (nonzero?) entries representing the set, and dimensions padded to the longest. was this developed before the invention of ragged tensors?
+      commonality = tf.sets.size(intersection) # (n_processes)
+      real_size = tf.cast(size, aggregates.dtype)
+      agreement = tf.cast(commonality, aggregates.dtype) / real_size
+      scores = tf.math.pow(discounts, real_size-1) * agreement[:, None] # (n_processes x n_scores)
+      total_scores += tf.ensure_shape(scores, [n_processes, n_scores])
+    return (1-discounts) * total_scores
+  return eval, [n_scores]
+
+def score_normed_error(power, transform = lambda x: x, n_splits=None):
+  def eval(aggregates, real_aggregate):
+    nonlocal power
+    power = tf.cast(power, aggregates.dtype)
+    error = transform(aggregates) - transform(real_aggregate)
+    normed_error = tf.math.pow(tf.math.abs(error), power)
+    if n_splits is None:
+      rank = len(aggregates.shape)
+      summation_axes = list(range(1, rank)) # either (1, 2) or (1,) depending on whether a temporal dimension is present
+    else:
+      summation_axes = 1 # if n_splits is supplied, then only sum over the event types
+    mean_normed_error = tf.math.reduce_mean(normed_error, axis=summation_axes)
+    return tf.math.pow(mean_normed_error, 1/power)
+  shape = [] if n_splits is None else [n_splits]
+  return eval, shape
+
+def score_squared_error(transform = lambda x: x, n_splits=None):
+  return score_normed_error(2.0, transform, n_splits)
+
+def blacklist_score(types, scorer): # `scorer` is the return value of one of the above
+  score, score_shape = scorer
+  types = tf.convert_to_tensor(types)
+  def eval(aggregates, real_aggregate):
+    nonlocal types # not needed, but added just in case
+    n_types = tf.shape(aggregates)[1]
+    filtered_indices_sparse = tf.sets.difference(tf.range(n_types)[None, :], types[None, :])
+    filtered_indices = tf.sort(tf.sparse.to_dense(filtered_indices_sparse)[0, :])
+    filtered_aggregates = tf.gather(aggregates, filtered_indices, axis=1)
+    filtered_real = tf.gather(real_aggregate, filtered_indices)
+    return score(filtered_aggregates, filtered_real)
+  return eval, score_shape
+
 # todo various rank-based metrics like normalized discounted cumulative gain
 # another todo: learn a MultivariateProcess (excitations only) by means of EM, and compare the results here.
+
+# Kendall's tau per event type, across time (within a mesoscale window)...
